@@ -30,18 +30,22 @@ import com.intellij.openapi.project.ProjectManager
 import com.intellij.openapi.projectRoots.SimpleJavaSdkType
 import com.intellij.openapi.roots.ModuleRootManager
 import com.intellij.openapi.roots.ProjectRootManager
+import com.intellij.openapi.roots.ui.configuration.DefaultModulesProvider
 import com.intellij.openapi.roots.ui.configuration.ModulesProvider
 import com.intellij.openapi.util.Couple
+import com.intellij.openapi.util.Disposer
 import com.intellij.openapi.util.Ref
 import com.intellij.openapi.util.io.FileUtil
 import com.intellij.openapi.util.text.StringUtil
 import com.intellij.openapi.vfs.LocalFileSystem
+import com.intellij.openapi.vfs.VfsUtil
 import com.intellij.openapi.vfs.VfsUtilCore
 import com.intellij.openapi.vfs.VirtualFile
 import com.intellij.testFramework.IdeaTestUtil
 import com.intellij.testFramework.UsefulTestCase
 import com.intellij.util.containers.ContainerUtil
 import com.intellij.util.containers.ContainerUtilRt
+import com.intellij.util.ui.UIUtil
 import junit.framework.TestCase
 import org.jetbrains.kotlin.idea.codeInsight.gradle.ExternalSystemImportingTestCase.LATEST_STABLE_GRADLE_PLUGIN_VERSION
 import org.jetbrains.kotlin.idea.codeInsight.gradle.GradleImportingTestCase
@@ -57,13 +61,29 @@ import org.jetbrains.plugins.gradle.util.GradleConstants
 import org.jetbrains.plugins.groovy.GroovyFileType
 import java.io.File
 import java.io.IOException
+import java.nio.file.Paths
 
 abstract class AbstractGradleMultiplatformWizardTest : ProjectWizardTestCase<AbstractProjectWizard>() {
 
     private val pluginVersion = LATEST_STABLE_GRADLE_PLUGIN_VERSION
 
     override fun createWizard(project: Project?, directory: File): AbstractProjectWizard {
-        return NewProjectWizard(project, ModulesProvider.EMPTY_MODULES_PROVIDER, directory.path)
+        return NewProjectWizard(
+            project,
+            if (project != null) DefaultModulesProvider(project) else ModulesProvider.EMPTY_MODULES_PROVIDER,
+            directory.path
+        )
+    }
+
+    override fun createWizard(project: Project?) {
+        val directory = if (project != null) File(project.basePath!!) else FileUtil.createTempDirectory(name, "new", false)
+        myFilesToDelete.add(directory)
+        if (myWizard != null) {
+            Disposer.dispose(myWizard.disposable)
+            myWizard = null
+        }
+        myWizard = createWizard(project, directory)
+        UIUtil.dispatchAllInvocationEvents() // to make default selection applied
     }
 
     private fun Project.reconfigureGradleSettings(f: GradleProjectSettings.() -> Unit) {
@@ -84,7 +104,8 @@ abstract class AbstractGradleMultiplatformWizardTest : ProjectWizardTestCase<Abs
         vararg testClassNames: String,
         metadataInside: Boolean = false,
         performImport: Boolean = true,
-        useQualifiedModuleNames: Boolean = false
+        useQualifiedModuleNames: Boolean = false,
+        dirsForCheck: Map<String, List<String>>? = null
     ): Project {
         val project = createProject { step ->
             if (step is ProjectTypeStep) {
@@ -118,7 +139,18 @@ abstract class AbstractGradleMultiplatformWizardTest : ProjectWizardTestCase<Abs
             TestCase.assertTrue("enableFeaturePreview('GRADLE_METADATA')" in settingsScriptText)
         }
 
-        File(root.canonicalPath).assertNoEmptyChildren()
+        File(root.canonicalPath!!).assertNoEmptyChildren()
+
+        if (dirsForCheck != null) {
+            for (folder in dirsForCheck.keys) {
+                val expectedSubFolders = dirsForCheck[folder]
+                val subFolders = File(Paths.get(root.canonicalPath!!, folder).toString()).listFiles(File::isDirectory)
+                TestCase.assertTrue(subFolders!!.size == expectedSubFolders!!.size)
+                for (subFolder in subFolders)
+                    TestCase.assertTrue("Folder ($subFolder) is not expected",
+                                        expectedSubFolders.any { subFolder.canonicalPath.toString().endsWith(it) })
+            }
+        }
 
         val buildScript = VfsUtilCore.findRelativeFile("build.gradle", root)!!
         val buildScriptText = StringUtil.convertLineSeparators(VfsUtilCore.loadText(buildScript))
@@ -129,6 +161,41 @@ abstract class AbstractGradleMultiplatformWizardTest : ProjectWizardTestCase<Abs
         if (testClassNames.isNotEmpty()) {
             doTestProject(project, *testClassNames)
         }
+        return project
+    }
+
+    protected fun testAddModule(
+        builder: KotlinGradleAbstractMultiplatformModuleBuilder,
+        project: Project,
+    ): Project {
+        val modulesBefore = ModuleManager.getInstance(project).modules
+        val moduleProject = createModuleFromTemplate("Kotlin", builder.presentableName, project) { step ->
+            if (step is ProjectTypeStep) {
+                TestCase.assertTrue(step.setSelectedTemplate("Kotlin", builder.presentableName))
+                val steps = myWizard.sequence.selectedSteps
+                TestCase.assertEquals(4, steps.size)
+                val projectBuilder = myWizard.projectBuilder
+                UsefulTestCase.assertInstanceOf(projectBuilder, builder::class.java)
+                with(projectBuilder as KotlinGradleAbstractMultiplatformModuleBuilder) {
+                    explicitPluginVersion = pluginVersion
+                }
+
+                myProject.reconfigureGradleSettings {
+                    distributionType = DistributionType.DEFAULT_WRAPPED
+                }
+            }
+        }
+
+        val modules = ModuleManager.getInstance(project).modules
+        TestCase.assertEquals(modulesBefore.size + 1, modules.size)
+
+        val root = ProjectRootManager.getInstance(project).contentRoots[0]
+
+        val moduleDir = VfsUtilCore.findRelativeFile("untitled", root)
+        TestCase.assertNotNull(moduleDir)
+
+        //ToDo: add additional checks
+
         return project
     }
 
@@ -167,7 +234,7 @@ abstract class AbstractGradleMultiplatformWizardTest : ProjectWizardTestCase<Abs
         }.execute()
     }
 
-    private fun doImportProject(project: Project, useQualifiedModuleNames: Boolean = false) {
+    protected fun doImportProject(project: Project, useQualifiedModuleNames: Boolean = false, expectedError: String? = null) {
         ExternalSystemApiUtil.subscribe(
             project,
             GradleConstants.SYSTEM_ID,
@@ -194,6 +261,77 @@ abstract class AbstractGradleMultiplatformWizardTest : ProjectWizardTestCase<Abs
             isUseQualifiedModuleNames = useQualifiedModuleNames
         }
 
+        val error = refreshProject(project)
+        if (!expectedError.isNullOrEmpty()) {
+            TestCase.assertTrue("Import should not be success", !error.isNull)
+            TestCase.assertTrue("Exception should be ($expectedError)", error.get().first.contains(expectedError))
+        } else if (!error.isNull) {
+            var failureMsg = "Import failed: " + error.get().first
+            if (StringUtil.isNotEmpty(error.get().second)) {
+                failureMsg += "\nError details: \n" + error.get().second
+            }
+            TestCase.fail(failureMsg)
+        }
+    }
+
+    protected fun setAndroidSdk(project: Project, androidSdk: String, vararg testClassNames: String) {
+        val root = ProjectRootManager.getInstance(project).contentRoots[0]
+        val localProp = VfsUtilCore.findRelativeFile("local.properties", root)
+
+        TestCase.assertNotNull(localProp)
+        runWrite {
+            VfsUtil.saveText(
+                localProp!!,
+                StringUtil.convertLineSeparators(VfsUtilCore.loadText(localProp))
+                    .replace("PleaseSpecifyAndroidSdkPathHere", androidSdk)
+            )
+        }
+
+        val error = refreshProject(project)
+        if (!error.isNull) {
+            var failureMsg = "Refresh failed: " + error.get().first
+            if (StringUtil.isNotEmpty(error.get().second)) {
+                failureMsg += "\nError details: \n" + error.get().second
+            }
+            TestCase.fail(failureMsg)
+        }
+
+        doTestProject(project, *testClassNames)
+    }
+
+    protected fun changeGradleVersions(project: Project, versions: List<String>) {
+        val root = ProjectRootManager.getInstance(project).contentRoots[0]
+        runWrite { VfsUtilCore.findRelativeFile("gradle/wrapper/gradle-wrapper.jar", root)?.delete(this) }
+
+        versions.forEach {
+            changeGradleVersion(root, it)
+            val error = refreshProject(project)
+            if (!error.isNull) {
+                var failureMsg = "Refresh failed: " + error.get().first
+                if (StringUtil.isNotEmpty(error.get().second)) {
+                    failureMsg += "\nError details: \n" + error.get().second
+                }
+                TestCase.fail(failureMsg)
+            }
+        }
+    }
+
+    private fun changeGradleVersion(root: VirtualFile, version: String) {
+        val regex = """(-\d.*\d-)""".toRegex()
+        val gradleProperties = VfsUtilCore.findRelativeFile("gradle/wrapper/gradle-wrapper.properties", root)
+
+        runWrite {
+            VfsUtil.saveText(
+                gradleProperties!!,
+                regex.replace(
+                    StringUtil.convertLineSeparators(VfsUtilCore.loadText(gradleProperties)),
+                    "-$version-"
+                )
+            )
+        }
+    }
+
+    private fun refreshProject(project: Project): Ref<Couple<String>> {
         val error = Ref.create<Couple<String>>()
         ExternalSystemUtil.refreshProjects(
             ImportSpecBuilder(project, externalSystemId)
@@ -217,13 +355,7 @@ abstract class AbstractGradleMultiplatformWizardTest : ProjectWizardTestCase<Abs
                 .forceWhenUptodate()
         )
 
-        if (!error.isNull) {
-            var failureMsg = "Import failed: " + error.get().first
-            if (StringUtil.isNotEmpty(error.get().second)) {
-                failureMsg += "\nError details: \n" + error.get().second
-            }
-            TestCase.fail(failureMsg)
-        }
+        return error
     }
 
     private fun doTestProject(project: Project, vararg testClassNames: String) {
